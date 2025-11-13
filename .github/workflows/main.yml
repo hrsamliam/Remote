@@ -1,0 +1,93 @@
+name: RDP
+
+on:
+  push:
+    branches:
+      - main  # Automatically triggers on push to 'main' branch
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest  # This uses GitHub's Windows hosted runners
+    
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          $null = Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          $null = Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          $null = Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+          $null = netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          $null = netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          $null = Restart-Service -Name TermService -Force
+        continue-on-error: false
+
+      - name: Create RDP User with Static Password
+        run: |
+          $password = "Test@129"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # If user already exists, reset password; otherwise, create
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          # Do not print password in logs
+          $null = echo "RDP_CREDS=User: RDP | Password: [REDACTED]" >> $env:GITHUB_ENV
+        continue-on-error: false
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          # Download and install Tailscale silently
+          $null = Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          $null = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          $null = Remove-Item $installerPath -Force
+        continue-on-error: false
+
+      - name: Establish Tailscale Connection
+        run: |
+          $null = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          # Store IP in environment variable but do not log
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+        continue-on-error: false
+
+      - name: Verify RDP Accessibility
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+        continue-on-error: false
+
+      - name: Maintain Connection
+        run: |
+          # Keep the RDP session alive
+          while ($true) {
+              Start-Sleep -Seconds 300
+          }
+        continue-on-error: false
